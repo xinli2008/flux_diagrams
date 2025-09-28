@@ -1,5 +1,5 @@
 # flux_demo
 
-## Flux architecture
+## Flux dev architecture
 
-![flux](./assets/flux_architecture.png)
+![flux](./assets/flux_dev_architecture.png)
