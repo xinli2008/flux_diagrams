@@ -4,7 +4,7 @@
 ![flux_dev](./assets/flux_dev_architecture.png)
 
 ## Flux kontext architecture
-![flux_kontext](./assets/flux_kontext.png)
+![flux_kontext](./assets/flux-kontext.png)
 
 ## Flux inpaint/outpaint pipeline
 ![flux_inpaint/outpaint_pipeline](./assets/flux_inpaint_outpaint_pipeline.png)
