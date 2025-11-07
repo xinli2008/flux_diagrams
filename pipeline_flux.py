@@ -28,7 +28,8 @@ from transformers import (
 
 from diffusers.image_processor import PipelineImageInput, VaeImageProcessor
 from diffusers.loaders import FluxIPAdapterMixin, FluxLoraLoaderMixin, FromSingleFileMixin, TextualInversionLoaderMixin
-from diffusers.models import AutoencoderKL, FluxTransformer2DModel
+from diffusers.models import AutoencoderKL
+from transformer_flux import FluxTransformer2DModel
 from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
 from diffusers.utils import (
     USE_PEFT_BACKEND,
@@ -384,6 +385,8 @@ class FluxPipeline(
                 unscale_lora_layers(self.text_encoder_2, lora_scale)
 
         dtype = self.text_encoder.dtype if self.text_encoder is not None else self.transformer.dtype
+
+        # 在FLUX中, 文本的ids设置为全0, (0, 0, 0)
         text_ids = torch.zeros(prompt_embeds.shape[1], 3).to(device=device, dtype=dtype)
 
         return prompt_embeds, pooled_prompt_embeds, text_ids
@@ -836,6 +839,8 @@ class FluxPipeline(
             max_sequence_length=max_sequence_length,
             lora_scale=lora_scale,
         )
+
+        # NOTE: 在flux的pipeline中, 同样使用了classifier-free guidance的方法。如果推理的时候传入了negative prompt, 并且true_cfg_scale > 1, 则启用true classifier-free guidance。
         if do_true_cfg:
             (
                 negative_prompt_embeds,
@@ -882,7 +887,7 @@ class FluxPipeline(
             self.scheduler.config.get("max_shift", 1.15),
         )
 
-        # 根据图像分辨率得到mu后, 我们将mu传递给scheduler，来得到最终的timestep序列。
+        # 根据图像分辨率得到mu后, 我们将mu和sigmas传递给scheduler，来得到最终的timestep序列。
         timesteps, num_inference_steps = retrieve_timesteps(
             self.scheduler,
             num_inference_steps,
@@ -950,7 +955,7 @@ class FluxPipeline(
                 with self.transformer.cache_context("cond"):
                     noise_pred = self.transformer(
                         hidden_states=latents,
-                        timestep=timestep / 1000,
+                        timestep=timestep / 1000,              # Flux是基于flow-matching的扩散模型, 因此时间步长需要除以1000
                         guidance=guidance,
                         pooled_projections=pooled_prompt_embeds,
                         encoder_hidden_states=prompt_embeds,

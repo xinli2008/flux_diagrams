@@ -33,11 +33,13 @@ from diffusers.models.embeddings import (
     CombinedTimestepTextProjEmbeddings,
     apply_rotary_emb,
     get_1d_rotary_pos_embed,
+    CombinedTimestepLabelEmbeddings
 )
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.modeling_utils import ModelMixin
-from diffusers.models.normalization import AdaLayerNormContinuous, AdaLayerNormZero, AdaLayerNormZeroSingle
-
+from diffusers.models.normalization import AdaLayerNormContinuous, FP32LayerNorm
+from diffusers.models.activations import FP32SiLU, get_activation
+import math
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -88,6 +90,8 @@ class FluxAttnProcessor:
         attention_mask: Optional[torch.Tensor] = None,
         image_rotary_emb: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        
+        # 在Flux的DoubleStreamTransformerBlock中, hidden_states和encoder_hidden_states是经过了不同的QKV-projection网络
         query, key, value, encoder_query, encoder_key, encoder_value = _get_qkv_projections(
             attn, hidden_states, encoder_hidden_states
         )
@@ -107,11 +111,14 @@ class FluxAttnProcessor:
             encoder_query = attn.norm_added_q(encoder_query)
             encoder_key = attn.norm_added_k(encoder_key)
 
+            # 在Flux的DoubleStreamTransformerBlock中, hidden_states和encoder_hidden_states是经过了不同的QKV-projection网络
+            # 然后在通过concat的方式将文本的和图像的query,key,value拼接在一起
             query = torch.cat([encoder_query, query], dim=1)
             key = torch.cat([encoder_key, key], dim=1)
             value = torch.cat([encoder_value, value], dim=1)
 
         if image_rotary_emb is not None:
+            # 对query和key应用旋转位置编码
             query = apply_rotary_emb(query, image_rotary_emb, sequence_dim=1)
             key = apply_rotary_emb(key, image_rotary_emb, sequence_dim=1)
 
@@ -352,6 +359,81 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
         return self.processor(self, hidden_states, encoder_hidden_states, attention_mask, image_rotary_emb, **kwargs)
 
 
+class AdaLayerNormZeroSingle(nn.Module):
+    r"""
+    Norm layer adaptive layer norm zero (adaLN-Zero).
+
+    Parameters:
+        embedding_dim (`int`): The size of each embedding vector.
+        num_embeddings (`int`): The size of the embeddings dictionary.
+    """
+
+    def __init__(self, embedding_dim: int, norm_type="layer_norm", bias=True):
+        super().__init__()
+
+        self.silu = nn.SiLU()
+        self.linear = nn.Linear(embedding_dim, 3 * embedding_dim, bias=bias)
+        if norm_type == "layer_norm":
+            self.norm = nn.LayerNorm(embedding_dim, elementwise_affine=False, eps=1e-6)
+        else:
+            raise ValueError(
+                f"Unsupported `norm_type` ({norm_type}) provided. Supported ones are: 'layer_norm', 'fp32_layer_norm'."
+            )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        emb: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        emb = self.linear(self.silu(emb))
+        shift_msa, scale_msa, gate_msa = emb.chunk(3, dim=1)
+        x = self.norm(x) * (1 + scale_msa[:, None]) + shift_msa[:, None]
+        return x, gate_msa
+
+
+class AdaLayerNormZero(nn.Module):
+    r"""
+    Norm layer adaptive layer norm zero (adaLN-Zero).
+
+    Parameters:
+        embedding_dim (`int`): The size of each embedding vector.
+        num_embeddings (`int`): The size of the embeddings dictionary.
+    """
+
+    def __init__(self, embedding_dim: int, num_embeddings: Optional[int] = None, norm_type="layer_norm", bias=True):
+        super().__init__()
+        if num_embeddings is not None:
+            self.emb = CombinedTimestepLabelEmbeddings(num_embeddings, embedding_dim)
+        else:
+            self.emb = None
+
+        self.silu = nn.SiLU()
+        self.linear = nn.Linear(embedding_dim, 6 * embedding_dim, bias=bias)
+        if norm_type == "layer_norm":
+            self.norm = nn.LayerNorm(embedding_dim, elementwise_affine=False, eps=1e-6)
+        elif norm_type == "fp32_layer_norm":
+            self.norm = FP32LayerNorm(embedding_dim, elementwise_affine=False, bias=False)
+        else:
+            raise ValueError(
+                f"Unsupported `norm_type` ({norm_type}) provided. Supported ones are: 'layer_norm', 'fp32_layer_norm'."
+            )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        timestep: Optional[torch.Tensor] = None,
+        class_labels: Optional[torch.LongTensor] = None,
+        hidden_dtype: Optional[torch.dtype] = None,
+        emb: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.emb is not None:
+            emb = self.emb(timestep, class_labels, hidden_dtype=hidden_dtype)
+        emb = self.linear(self.silu(emb))
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = emb.chunk(6, dim=1)
+        x = self.norm(x) * (1 + scale_msa[:, None]) + shift_msa[:, None]
+        return x, gate_msa, shift_mlp, scale_mlp, gate_mlp
+
+
 @maybe_allow_in_graph
 class FluxSingleTransformerBlock(nn.Module):
     def __init__(self, dim: int, num_attention_heads: int, attention_head_dim: int, mlp_ratio: float = 4.0):
@@ -520,6 +602,184 @@ class FluxPosEmbed(nn.Module):
         freqs_cos = torch.cat(cos_out, dim=-1).to(ids.device)
         freqs_sin = torch.cat(sin_out, dim=-1).to(ids.device)
         return freqs_cos, freqs_sin
+
+
+def get_timestep_embedding(
+    timesteps: torch.Tensor,
+    embedding_dim: int,
+    flip_sin_to_cos: bool = False,
+    downscale_freq_shift: float = 1,
+    scale: float = 1,
+    max_period: int = 10000,
+) -> torch.Tensor:
+    """
+    This matches the implementation in Denoising Diffusion Probabilistic Models: Create sinusoidal timestep embeddings.
+
+    Args
+        timesteps (torch.Tensor):
+            a 1-D Tensor of N indices, one per batch element. These may be fractional.
+        embedding_dim (int):
+            the dimension of the output.
+        flip_sin_to_cos (bool):
+            Whether the embedding order should be `cos, sin` (if True) or `sin, cos` (if False)
+        downscale_freq_shift (float):
+            Controls the delta between frequencies between dimensions
+        scale (float):
+            Scaling factor applied to the embeddings.
+        max_period (int):
+            Controls the maximum frequency of the embeddings
+    Returns
+        torch.Tensor: an [N x dim] Tensor of positional embeddings.
+    """
+    assert len(timesteps.shape) == 1, "Timesteps should be a 1d-array"
+
+    half_dim = embedding_dim // 2
+    exponent = -math.log(max_period) * torch.arange(
+        start=0, end=half_dim, dtype=torch.float32, device=timesteps.device
+    )
+    exponent = exponent / (half_dim - downscale_freq_shift)
+
+    emb = torch.exp(exponent)
+    emb = timesteps[:, None].float() * emb[None, :]
+
+    # scale embeddings
+    emb = scale * emb
+
+    # concat sine and cosine embeddings
+    emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=-1)
+
+    # flip sine and cosine embeddings
+    if flip_sin_to_cos:
+        emb = torch.cat([emb[:, half_dim:], emb[:, :half_dim]], dim=-1)
+
+    # zero pad
+    if embedding_dim % 2 == 1:
+        emb = torch.nn.functional.pad(emb, (0, 1, 0, 0))
+    return emb
+
+
+class TimestepEmbedding(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        time_embed_dim: int,
+        act_fn: str = "silu",
+        out_dim: int = None,
+        post_act_fn: Optional[str] = None,
+        cond_proj_dim=None,
+        sample_proj_bias=True,
+    ):
+        super().__init__()
+
+        self.linear_1 = nn.Linear(in_channels, time_embed_dim, sample_proj_bias)
+
+        if cond_proj_dim is not None:
+            self.cond_proj = nn.Linear(cond_proj_dim, in_channels, bias=False)
+        else:
+            self.cond_proj = None
+
+        self.act = get_activation(act_fn)
+
+        if out_dim is not None:
+            time_embed_dim_out = out_dim
+        else:
+            time_embed_dim_out = time_embed_dim
+        self.linear_2 = nn.Linear(time_embed_dim, time_embed_dim_out, sample_proj_bias)
+
+        if post_act_fn is None:
+            self.post_act = None
+        else:
+            self.post_act = get_activation(post_act_fn)
+
+    def forward(self, sample, condition=None):
+        if condition is not None:
+            sample = sample + self.cond_proj(condition)
+        sample = self.linear_1(sample)
+
+        if self.act is not None:
+            sample = self.act(sample)
+
+        sample = self.linear_2(sample)
+
+        if self.post_act is not None:
+            sample = self.post_act(sample)
+        return sample
+
+
+class Timesteps(nn.Module):
+    def __init__(self, num_channels: int, flip_sin_to_cos: bool, downscale_freq_shift: float, scale: int = 1):
+        super().__init__()
+        self.num_channels = num_channels
+        self.flip_sin_to_cos = flip_sin_to_cos
+        self.downscale_freq_shift = downscale_freq_shift
+        self.scale = scale
+
+    def forward(self, timesteps: torch.Tensor) -> torch.Tensor:
+        t_emb = get_timestep_embedding(
+            timesteps,
+            self.num_channels,
+            flip_sin_to_cos=self.flip_sin_to_cos,
+            downscale_freq_shift=self.downscale_freq_shift,
+            scale=self.scale,
+        )
+        return t_emb
+
+
+class CombinedTimestepGuidanceTextProjEmbeddings(nn.Module):
+    r"""
+    在Flux网络结构中, Timestep Embedding、Guidance Embedding和Clip pooled Projection Embedding会通过相加的方式进行融合,
+    然后作为条件信息输入到Transformer模块中。
+    """
+    def __init__(self, embedding_dim, pooled_projection_dim):
+        super().__init__()
+
+        self.time_proj = Timesteps(num_channels=256, flip_sin_to_cos=True, downscale_freq_shift=0)
+        self.timestep_embedder = TimestepEmbedding(in_channels=256, time_embed_dim=embedding_dim)
+        self.guidance_embedder = TimestepEmbedding(in_channels=256, time_embed_dim=embedding_dim)
+        self.text_embedder = PixArtAlphaTextProjection(pooled_projection_dim, embedding_dim, act_fn="silu")
+
+    def forward(self, timestep, guidance, pooled_projection):
+        timesteps_proj = self.time_proj(timestep)
+        timesteps_emb = self.timestep_embedder(timesteps_proj.to(dtype=pooled_projection.dtype))  # (N, D)
+
+        guidance_proj = self.time_proj(guidance)
+        guidance_emb = self.guidance_embedder(guidance_proj.to(dtype=pooled_projection.dtype))  # (N, D)
+
+        time_guidance_emb = timesteps_emb + guidance_emb
+
+        pooled_projections = self.text_embedder(pooled_projection)
+        conditioning = time_guidance_emb + pooled_projections
+
+        return conditioning
+
+
+class PixArtAlphaTextProjection(nn.Module):
+    """
+    Projects caption embeddings. Also handles dropout for classifier-free guidance.
+
+    Adapted from https://github.com/PixArt-alpha/PixArt-alpha/blob/master/diffusion/model/nets/PixArt_blocks.py
+    """
+
+    def __init__(self, in_features, hidden_size, out_features=None, act_fn="gelu_tanh"):
+        super().__init__()
+        if out_features is None:
+            out_features = hidden_size
+        self.linear_1 = nn.Linear(in_features=in_features, out_features=hidden_size, bias=True)
+        if act_fn == "gelu_tanh":
+            self.act_1 = nn.GELU(approximate="tanh")
+        elif act_fn == "silu":
+            self.act_1 = nn.SiLU()
+        elif act_fn == "silu_fp32":
+            self.act_1 = FP32SiLU()
+        else:
+            raise ValueError(f"Unknown activation function: {act_fn}")
+        self.linear_2 = nn.Linear(in_features=hidden_size, out_features=out_features, bias=True)
+
+    def forward(self, caption):
+        hidden_states = self.linear_1(caption)
+        hidden_states = self.act_1(hidden_states)
+        hidden_states = self.linear_2(hidden_states)
+        return hidden_states
 
 
 class FluxTransformer2DModel(
@@ -716,6 +976,7 @@ class FluxTransformer2DModel(
             )
             img_ids = img_ids[0]
 
+        # 在Flux模型结构中, 文本的ids是(0,0,0), 图像的ids是(0,i,j), 通过拼接文本和图像的ids来生成联合的旋转位置编码.
         ids = torch.cat((txt_ids, img_ids), dim=0)
         image_rotary_emb = self.pos_embed(ids)
 
